@@ -1,6 +1,6 @@
 # sendtokindle MCP Server — Specification
 
-**Status:** Draft v0.2 (2026-10-01). Decisions from the first interview are included.
+**Status:** v0.3 (2026-10-01). Implemented; this version records implementation details.
 **Owner:** Tasman Mayers
 
 ---
@@ -44,7 +44,7 @@ It does two things:
 | Concern | Choice | Type |
 |---|---|---|
 | Language | Python 3.12+ | — |
-| MCP protocol | Official `mcp` Python SDK (`mcp.server.fastmcp.FastMCP`), stdio transport, version pinned in `requirements.txt` | Third-party (accepted standard for MCP) |
+| MCP protocol | Official `mcp` Python SDK 2.x (`mcp.server.MCPServer`, formerly `FastMCP`), stdio transport, version pinned in `requirements.txt` | Third-party (accepted standard for MCP) |
 | Markdown → EPUB | **Pandoc** binary installed in the image, called through `subprocess` | System binary |
 | Email | `smtplib`, `email.message.EmailMessage`, `ssl` | stdlib |
 | Paths / temp files | `pathlib`, `os.path.realpath`, `tempfile` | stdlib |
@@ -74,7 +74,10 @@ docker run -i --rm  sendtokindle
   ├── paths.py         host↔container path mapping, confinement checks
   ├── convert.py       Markdown → EPUB (pandoc wrapper, metadata, CSS)
   ├── mailer.py        MIME message construction + SMTP send
-  └── assets/kindle.css
+  └── assets/
+      ├── kindle.css       EPUB stylesheet
+      ├── inspect.lua      Pandoc writer: title, author, first heading, image sources as JSON
+      └── drop_images.lua  Pandoc filter: replaces blocked images with their alt text
 ```
 
 - **Transport:** stdio only. The MCP client starts the container with `docker run -i --rm ...`, so the container lives for one client session.
@@ -142,15 +145,21 @@ Converts a Markdown file to EPUB and emails it to the Kindle.
 
 **Steps:**
 1. Check config, resolve and confine the path, check the extension, and check the size (Markdown ≤ 5 MB).
-2. Run Pandoc (list arguments, no shell, 60 s timeout):
+2. **Inspect** the document with Pandoc, using the `inspect.lua` custom writer. This gets the effective title and author (front matter merged with the defaults and arguments), the first level-1 heading, and every image source. Pandoc parses the YAML and Markdown, so neither is parsed by hand.
+   - `DEFAULT_AUTHOR` and `DEFAULT_LANGUAGE` are passed with `--metadata-file`, so front matter overrides them.
+   - The `author` argument is passed with `--metadata`, so it overrides front matter.
+3. **Classify images.** Each image source is checked in Python:
+   - `data:` URIs are kept.
+   - Any URL scheme (`http(s)://`, `file://`, …) means the image is skipped as **remote** and never fetched.
+   - A local path is resolved relative to the Markdown file and embedded only if it resolves inside `DATA_DIR` and exists. Otherwise it is skipped.
+4. **Convert** with Pandoc (list arguments, no shell, 60 s timeout):
    ```
-   pandoc <file> -f gfm+yaml_metadata_block+footnotes -t epub3
-          --css /app/assets/kindle.css --resource-path <dir of file>
-          --metadata title=<t> --metadata author=<a> --metadata lang=<l>
-          [--toc] -o <tmp>/<safe-title>.epub
+   pandoc <file> -f gfm+yaml_metadata_block+footnotes -t epub3 -o <tmp>/<safe-title>.epub
+          --metadata-file <defaults.json> [--metadata author=<a>] --metadata title=<t>
+          --resource-path <dir of file> --css assets/kindle.css
+          --lua-filter assets/drop_images.lua --syntax-highlighting monochrome [--toc]
    ```
-3. **Local images** (`![](./img/a.png)`) are resolved relative to the Markdown file and embedded. A referenced image that would resolve outside `DATA_DIR` is not embedded, and the result includes a warning.
-4. **Remote images** (`http(s)://`) are not fetched. Pandoc runs with network access disabled for resources, the image is left out, and its alt text is kept. The result lists any images that were skipped.
+   The skipped images are passed to `drop_images.lua` (as JSON in an environment variable). The filter replaces each one with its alt text. The result lists every skipped image and the reason.
 5. Check that the EPUB was created and is ≤ `MAX_ATTACHMENT_MB`. Send it (§8).
 
 ### 7.3 Tool: `send_pdf`
@@ -213,7 +222,7 @@ On failure, a tool returns an MCP tool error (`isError: true`) with a message th
   - `pre`/`code` in monospace, wrapping long lines
   - simple bordered tables
   - `img { max-width: 100%; height: auto; }`
-- Syntax highlighting uses a style that reads well in greyscale (e.g. Pandoc's `monochrome`).
+- Syntax highlighting uses Pandoc's `monochrome` style, which reads well in greyscale.
 
 ## 10. Docker image
 
@@ -296,7 +305,7 @@ The README will include a one-time setup checklist:
 - the OPF contains the expected metadata
 - local images are embedded
 
-SMTP is tested against a local stub server (stdlib-based test double); tests never send real email.
+SMTP is tested with a `unittest.mock` test double for `smtplib.SMTP` / `SMTP_SSL`. The standard library has had no SMTP server since `smtpd` was removed in Python 3.12. Tests never send real email.
 
 **Acceptance criteria (v1):**
 1. Claude Desktop and Claude Code can both list and call all three tools using the §10.1 configurations.
